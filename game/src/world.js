@@ -1,193 +1,461 @@
-// Solport: a sun-soaked coastal city. Roads form a grid; blocks hold buildings,
-// one park, and the named places the story uses. Everything is seeded, so the
-// same seed builds the same city for every player and every screenshot.
-import { WORLD } from './config.js';
-import { createRandom, pick, range, int } from './random.js';
+// Solport's city and its simulation: roads, buildings, places, traffic,
+// pedestrians, police, cars, bullets and the wanted system. All state lives
+// in one `world` object created from a seed, so a staged screenshot can
+// rebuild the exact same city and play the real rules forward.
 
-export const ROAD_W = 92;
+import { WORLD, PLAYER, CAR, PISTOL, WANTED, MONEY } from './config.js';
+import { makeRng, pick, range, intRange } from './random.js';
 
-export const AVENUES = [200, 600, 1000, 1400, 1800, 2200, 2600];
-export const STREETS = [200, 550, 900, 1250, 1600];
+export const ROAD_W = 96;
+const BLOCK = 350;
 
-const ROOF_COLORS = ['#b5674e', '#7a8ba0', '#a08b6d', '#6d8a7a', '#96705a', '#5d6b8c', '#b08a4f'];
-const WALL_COLORS = ['#f2e3c9', '#e8d5b5', '#d9e2ec', '#f5d7d0', '#dcead9', '#e6d9f2', '#f7e8c8'];
-const SIGNS = [
-  'TACO JOINT', 'LAUNDROMAT', 'CORNER STORE', 'PIZZA', 'DONUTS', 'BARBER',
-  'SURF SHOP', 'GYM', 'FLOWERS', 'BOOKS', 'ARCADE', 'LIQUOR', 'PHARMACY',
-  'BURGER BAR', 'SUSHI', 'BIKES', 'RECORDS', 'CAFE', 'HOTEL', 'MOTEL',
-];
+function onRoad(x, y) {
+  if (x < 260) return false;
+  const rx = (x - 260) % BLOCK;
+  const ry = y % BLOCK;
+  return (rx < ROAD_W || ry < ROAD_W);
+}
+
+function roadCentre(v) {
+  return v - ((v - 260) % BLOCK) + ROAD_W / 2;
+}
+
+function nearestRoadPoint(x, y) {
+  const cx = roadCentre(x);
+  const cy = Math.floor(y / BLOCK) * BLOCK + ROAD_W / 2;
+  const dx = Math.abs(cx - x);
+  const dy = Math.abs(cy - y);
+  return dx < dy ? { x: cx, y } : { x, y: cy };
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
 
 export function createWorld(seed) {
-  const rand = createRandom(seed);
-  const buildings = [];
-  const palms = [];
-  const lamps = [];
-
-  // Named story places: fixed spots the missions and the HUD point at.
-  const locations = {
-    safehouse: { name: "Rico's Place", x: 330, y: 330, kind: 'safehouse' },
-    garage: { name: "Rosa's Garage", x: 640, y: 940, kind: 'garage' },
-    bank: { name: 'Bank of Solport', x: 1440, y: 590, kind: 'bank' },
-    docks: { name: 'Pier 9 Docks', x: 2560, y: 1290, kind: 'docks' },
-    hotel: { name: 'Hotel Solmar', x: 1840, y: 240, kind: 'hotel' },
-    gunstore: { name: 'Gun Barn', x: 1040, y: 1640, kind: 'gunstore' },
-    clinic: { name: 'Solport Clinic', x: 2240, y: 590, kind: 'clinic' },
-    respray: { name: 'Respray Garage', x: 1840, y: 1640, kind: 'respray' },
-    taco: { name: 'Taco Joint', x: 1040, y: 240, kind: 'shop' },
-    laundry: { name: 'Laundromat', x: 2240, y: 940, kind: 'shop' },
-    corner: { name: 'Corner Store', x: 1440, y: 1290, kind: 'shop' },
-    park: { name: 'Palm Park', x: 2000, y: 1075, kind: 'park' },
+  const rng = makeRng(seed);
+  const world = {
+    seed,
+    rng,
+    time: 0,
+    buildings: [],
+    trees: [],
+    parked: [],
+    traffic: [],
+    peds: [],
+    cops: [],
+    bullets: [],
+    particles: [],
+    pickups: [],
+    wanted: 0,
+    heat: 0,
+    copTimer: 0,
+    events: [],
+    player: null,
+    car: null,
+    taxiFare: null,
   };
 
-  function addBuilding(x, y, w, h, opts = {}) {
-    const b = {
-      x, y, w, h,
-      wall: opts.wall || pick(rand, WALL_COLORS),
-      roof: opts.roof || pick(rand, ROOF_COLORS),
-      sign: opts.sign || (rand() < 0.45 ? pick(rand, SIGNS) : null),
-      signColor: pick(rand, ['#ff5d8f', '#ffd166', '#4fc3f7', '#7CFC9A', '#ff9f1c']),
-      kind: opts.kind || 'building',
-      name: opts.name || null,
-      windows: int(rand, 2, 5),
-    };
-    buildings.push(b);
-    return b;
-  }
-
-  // One named building per story place, sitting on its block.
-  for (const key of Object.keys(locations)) {
-    const L = locations[key];
-    if (L.kind === 'park') continue;
-    addBuilding(L.x - 70, L.y - 45, 140, 90, { name: L.name, kind: L.kind, sign: L.name.toUpperCase() });
-  }
-
-  // Fill every other block with 1-3 buildings, leaving the park block green.
-  for (let ai = 0; ai < AVENUES.length - 1; ai++) {
-    for (let si = 0; si < STREETS.length - 1; si++) {
-      const x0 = AVENUES[ai] + ROAD_W / 2 + 14;
-      const x1 = AVENUES[ai + 1] - ROAD_W / 2 - 14;
-      const y0 = STREETS[si] + ROAD_W / 2 + 14;
-      const y1 = STREETS[si + 1] - ROAD_W / 2 - 14;
-      const cx = (x0 + x1) / 2;
-      const cy = (y0 + y1) / 2;
-      // Palm Park block: no buildings, just trees.
-      if (Math.abs(cx - 2000) < 220 && Math.abs(cy - 1075) < 190) continue;
-      // Skip blocks that already hold a named place.
-      const taken = Object.values(locations).some(
-        (L) => L.kind !== 'park' && L.x > x0 - 90 && L.x < x1 + 90 && L.y > y0 - 70 && L.y < y1 + 70,
-      );
-      if (taken) continue;
-      const n = int(rand, 1, 3);
-      for (let i = 0; i < n; i++) {
-        const w = range(rand, 70, 150);
-        const h = range(rand, 60, 120);
-        const x = range(rand, x0, x1 - w);
-        const y = range(rand, y0, y1 - h);
-        const b = { x, y, w, h };
-        if (buildings.some((o) => rectsOverlap(b, o, 18))) continue;
-        addBuilding(x, y, w, h);
+  // City blocks: buildings fill the space between roads; some blocks are parks.
+  for (let bx = 0; bx < 7; bx += 1) {
+    for (let by = 0; by < 5; by += 1) {
+      const x0 = 260 + bx * BLOCK + ROAD_W + 14;
+      const y0 = by * BLOCK + ROAD_W + 14;
+      const w = BLOCK - ROAD_W - 28;
+      const h = BLOCK - ROAD_W - 28;
+      if (rng() < 0.16) {
+        for (let t = 0; t < 5; t += 1) {
+          world.trees.push({ x: x0 + rng() * w, y: y0 + rng() * h, r: 12 + rng() * 10 });
+        }
+        continue;
+      }
+      const n = 1 + Math.floor(rng() * 2);
+      for (let i = 0; i < n; i += 1) {
+        const bw = w / n - 12;
+        world.buildings.push({
+          x: x0 + i * (w / n) + 4,
+          y: y0 + 6,
+          w: bw,
+          h: h - 12,
+          color: pick(rng, ['#b0563e', '#c07a3e', '#7d8aa0', '#a03e5c', '#4e7d6b', '#8a6fb0', '#5b7fa6']),
+          roof: pick(rng, ['#6e3a2c', '#54423a', '#3a4a5a']),
+        });
       }
     }
   }
 
-  // Palm trees along sidewalks and the beach, lamps at intersections.
-  for (let i = 0; i < 90; i++) {
-    const av = pick(rand, AVENUES);
-    const st = pick(rand, STREETS);
-    const side = rand() < 0.5 ? -1 : 1;
-    palms.push({ x: av + side * (ROAD_W / 2 + 10), y: range(rand, 120, WORLD.beachY - 60), lean: range(rand, -0.2, 0.2) });
-    palms.push({ x: range(rand, 120, WORLD.width - 120), y: st + side * (ROAD_W / 2 + 10), lean: range(rand, -0.2, 0.2) });
+  // Named places (door positions the player walks to).
+  world.places = {
+    safehouse: { x: 470, y: 1798, name: 'Safehouse', color: '#2e86de' },
+    gunbarn: { x: 1150, y: 380, name: 'Gun Barn', color: '#c0392b' },
+    clinic: { x: 1500, y: 1080, name: 'Clinic', color: '#27ae60' },
+    respray: { x: 2200, y: 730, name: 'Respray', color: '#8e44ad' },
+    garage: { x: 800, y: 1430, name: 'Garage', color: '#e67e22' },
+    bank: { x: 2550, y: 380, name: 'Bank of Solport', color: '#c9a227' },
+    marina: { x: 200, y: 900, name: 'Marina', color: '#2e7f9e' },
+    market: { x: 1850, y: 1780, name: 'Market', color: '#16a085' },
+  };
+
+  // Parked cars along the roads, some taxis.
+  for (let i = 0; i < 26; i += 1) {
+    const vertical = rng() < 0.5;
+    const road = 1 + Math.floor(rng() * 6);
+    const along = range(rng, 300, WORLD.height - 300);
+    const taxi = rng() < 0.18;
+    world.parked.push({
+      x: vertical ? 260 + road * BLOCK + ROAD_W / 2 + (rng() < 0.5 ? -24 : 24) : range(rng, 400, WORLD.width - 100),
+      y: vertical ? along : Math.floor(along / BLOCK) * BLOCK + ROAD_W / 2 + (rng() < 0.5 ? -24 : 24),
+      angle: vertical ? (rng() < 0.5 ? 0 : Math.PI) : (rng() < 0.5 ? Math.PI / 2 : -Math.PI / 2),
+      color: taxi ? '#f5c542' : pick(rng, ['#c0392b', '#2980b9', '#27ae60', '#8e44ad', '#e67e22', '#16a085', '#d5dbdb', '#7f8c8d']),
+      taxi,
+      speed: 0,
+      taken: false,
+    });
   }
-  for (let i = 0; i < 40; i++) {
-    palms.push({ x: range(rand, 60, WORLD.width - 60), y: range(rand, WORLD.beachY + 8, WORLD.seaY - 12), lean: range(rand, -0.25, 0.25) });
+
+  // Traffic cars cruising the roads.
+  for (let i = 0; i < 14; i += 1) {
+    const vertical = rng() < 0.5;
+    const road = 1 + Math.floor(rng() * 6);
+    world.traffic.push({
+      x: vertical ? 260 + road * BLOCK + ROAD_W / 2 : range(rng, 400, WORLD.width - 100),
+      y: vertical ? range(rng, 100, WORLD.height - 100) : Math.floor(range(rng, 100, WORLD.height - 100) / BLOCK) * BLOCK + ROAD_W / 2,
+      angle: vertical ? (rng() < 0.5 ? 0 : Math.PI) : (rng() < 0.5 ? Math.PI / 2 : -Math.PI / 2),
+      color: pick(rng, ['#c0392b', '#2980b9', '#27ae60', '#8e44ad', '#e67e22', '#16a085', '#d5dbdb']),
+      speed: range(rng, 140, 220),
+      taxi: false,
+    });
   }
-  for (const av of AVENUES) {
-    for (const st of STREETS) lamps.push({ x: av + ROAD_W / 2 + 6, y: st - ROAD_W / 2 - 6 });
+
+  // Pedestrians on the roads' edges (never inside buildings, where they
+  // would be stuck and drawn through roofs).
+  for (let i = 0; i < 46; i += 1) {
+    const vertical = rng() < 0.5;
+    const road = 1 + Math.floor(rng() * 6);
+    world.peds.push({
+      x: vertical ? 260 + road * BLOCK + ROAD_W / 2 + (rng() < 0.5 ? -34 : 34) : range(rng, 300, WORLD.width - 60),
+      y: vertical ? range(rng, 100, WORLD.height - 100) : Math.floor(range(rng, 100, WORLD.height - 100) / BLOCK) * BLOCK + ROAD_W / 2 + (rng() < 0.5 ? -34 : 34),
+      angle: rng() * Math.PI * 2,
+      speed: range(rng, 40, 80),
+      color: pick(rng, ['#e74c3c', '#9b59b6', '#1abc9c', '#e67e22', '#ecf0f1', '#f39c12']),
+      alive: true,
+      flee: 0,
+      hail: rng() < 0.14,
+    });
   }
 
-  return { buildings, palms, lamps, locations, rand };
+  world.player = {
+    // Spawn on the road by the Safehouse — never inside a city block,
+    // where the buildings would pin the player in place.
+    x: 470, y: 1760, angle: -Math.PI / 2, vx: 0, vy: 0,
+    health: PLAYER.health, hasPistol: false, ammo: 0,
+    cash: MONEY.start, inCar: null, fistTimer: 0, shootTimer: 0,
+    invulnerable: 0, dead: false, busted: false,
+  };
+  return world;
 }
 
-export function rectsOverlap(a, b, pad = 0) {
-  return a.x - pad < b.x + b.w + pad && a.x + a.w + pad > b.x - pad &&
-    a.y - pad < b.y + b.h + pad && a.y + a.h + pad > b.y - pad;
+function collideBuildings(world, x, y, r) {
+  for (const b of world.buildings) {
+    if (x + r > b.x && x - r < b.x + b.w && y + r > b.y && y - r < b.y + b.h) return true;
+  }
+  return false;
 }
 
-export function isRoad(x, y) {
-  const onV = AVENUES.some((av) => Math.abs(x - av) <= ROAD_W / 2);
-  const onH = STREETS.some((st) => Math.abs(y - st) <= ROAD_W / 2);
-  return onV || onH;
+function clampWorld(p) {
+  p.x = Math.max(30, Math.min(WORLD.width - 30, p.x));
+  p.y = Math.max(30, Math.min(WORLD.height - 30, p.y));
 }
 
-export function isWater(x, y) {
-  return y >= WORLD.seaY;
+export function addWanted(world, n) {
+  world.wanted = Math.min(WANTED.max, world.wanted + n);
+  world.heat = 1;
 }
 
-export function inBounds(x, y, m = 20) {
-  return x >= m && x <= WORLD.width - m && y >= m && y <= WORLD.height - m;
+export function spawnCop(world, near) {
+  const p = nearestRoadPoint(near.x + (world.rng() < 0.5 ? -260 : 260), near.y);
+  if (world.rng() < 0.5 || world.wanted < 2) {
+    world.cops.push({ x: p.x, y: p.y, angle: 0, speed: 0, onFoot: true, health: 60, shootTimer: 1 + world.rng() });
+  } else {
+    world.cops.push({
+      x: p.x, y: p.y, angle: 0, speed: 0, onFoot: false,
+      color: '#1f2a3a', health: 120, shootTimer: 0,
+    });
+  }
 }
 
-/** Push a circle out of every building it overlaps; returns true if it hit one. */
-export function collideCircle(buildings, x, y, r) {
-  let hit = false;
-  for (const b of buildings) {
-    const cx = Math.max(b.x, Math.min(x, b.x + b.w));
-    const cy = Math.max(b.y, Math.min(y, b.y + b.h));
-    const dx = x - cx;
-    const dy = y - cy;
-    const d2 = dx * dx + dy * dy;
-    if (d2 < r * r) {
-      hit = true;
-      if (d2 > 0.01) {
-        const d = Math.sqrt(d2);
-        const push = (r - d) / d;
-        x += dx * push;
-        y += dy * push;
-      } else {
-        // Dead centre: push out along the shortest side.
-        const left = x - b.x;
-        const right = b.x + b.w - x;
-        const top = y - b.y;
-        const bottom = b.y + b.h - y;
-        const m = Math.min(left, right, top, bottom);
-        if (m === left) x = b.x - r;
-        else if (m === right) x = b.x + b.w + r;
-        else if (m === top) y = b.y - r;
-        else y = b.y + b.h + r;
+function stepPlayer(world, input, dt, fire) {
+  const p = world.player;
+  if (p.dead || p.busted) return;
+  p.fistTimer = Math.max(0, p.fistTimer - dt);
+  p.shootTimer = Math.max(0, p.shootTimer - dt);
+  p.invulnerable = Math.max(0, p.invulnerable - dt);
+
+  if (p.inCar) {
+    const car = p.inCar;
+    const fwd = (input.held.up ? 1 : 0) - (input.held.down ? 0.6 : 0);
+    const steer = (input.held.left ? 1 : 0) - (input.held.right ? 1 : 0);
+    const moving = Math.abs(car.speed) > 20;
+    // Screen coordinates have y down, so the angle grows clockwise: turning
+    // left (counterclockwise) DECREASES it. Reversing flips the steering.
+    if (moving) car.angle -= steer * CAR.steer * dt * Math.sign(car.speed) * (input.held.brake ? 1.6 : 1);
+    if (input.held.brake) {
+      car.speed -= Math.sign(car.speed) * CAR.brake * dt;
+      if (Math.abs(car.speed) < 30) car.speed = 0;
+    } else if (fwd > 0) {
+      car.speed = Math.min(CAR.maxSpeed, car.speed + CAR.accel * dt);
+    } else if (fwd < 0) {
+      car.speed = Math.max(-CAR.maxReverse, car.speed - CAR.reverseAccel * dt);
+    } else {
+      car.speed -= car.speed * 1.4 * dt;
+      if (Math.abs(car.speed) < 8) car.speed = 0;
+    }
+    // Axis-separated movement so a car slides along walls instead of
+    // dead-stopping on them: the autopilot (and the player) can grind
+    // around a corner instead of getting wedged on it.
+    const nx = car.x + Math.cos(car.angle) * car.speed * dt;
+    if (!collideBuildings(world, nx, car.y, 24)) car.x = nx;
+    else car.speed *= 0.5;
+    const ny = car.y + Math.sin(car.angle) * car.speed * dt;
+    if (!collideBuildings(world, car.x, ny, 24)) car.y = ny;
+    else car.speed *= 0.5;
+    clampWorld(car);
+    p.x = car.x; p.y = car.y; p.angle = car.angle;
+    // Ramming peds and cops while speeding.
+    if (Math.abs(car.speed) > 260) {
+      for (const ped of world.peds) {
+        if (ped.alive && dist(ped, car) < 40) {
+          ped.alive = false;
+          addWanted(world, WANTED.hitPed);
+          world.events.push({ type: 'pedDown' });
+        }
+      }
+      for (const cop of world.cops) {
+        if (cop.onFoot && dist(cop, car) < 44) {
+          cop.health = 0;
+          addWanted(world, WANTED.killCop);
+          world.events.push({ type: 'copDown' });
+        }
+      }
+    }
+    return;
+  }
+
+  let mx = (input.held.right ? 1 : 0) - (input.held.left ? 1 : 0);
+  let my = (input.held.down ? 1 : 0) - (input.held.up ? 1 : 0);
+  const len = Math.hypot(mx, my);
+  if (len > 0) { mx /= len; my /= len; }
+  const speed = input.held.run ? PLAYER.runSpeed : PLAYER.walkSpeed;
+  p.vx += (mx * speed - p.vx) * Math.min(1, PLAYER.accel * dt / speed);
+  p.vy += (my * speed - p.vy) * Math.min(1, PLAYER.accel * dt / speed);
+  const nx = p.x + p.vx * dt;
+  const ny = p.y + p.vy * dt;
+  if (!collideBuildings(world, nx, p.y, PLAYER.radius)) p.x = nx;
+  if (!collideBuildings(world, p.x, ny, PLAYER.radius)) p.y = ny;
+  clampWorld(p);
+  if (len > 0) p.angle = Math.atan2(my, mx);
+
+  // Fist fight: nearest ped or cop in range.
+  if (input.pressed.interact && p.fistTimer <= 0) {
+    p.fistTimer = PLAYER.fistRate;
+    const targets = [...world.peds.filter((q) => q.alive), ...world.cops.filter((q) => q.health > 0)];
+    for (const t of targets) {
+      if (dist(t, p) < PLAYER.fistRange) {
+        if (t.alive !== undefined) { t.alive = false; addWanted(world, WANTED.hitPed); }
+        else { t.health -= PLAYER.fistDamage; if (t.health <= 0) addWanted(world, WANTED.killCop); }
+        world.events.push({ type: 'punch' });
+        break;
       }
     }
   }
-  return { x, y, hit };
+  // Pistol: aim with the mouse, click to fire.
+  if (p.hasPistol && p.ammo > 0 && input.mouse.clicked && p.shootTimer <= 0) {
+    p.shootTimer = PISTOL.rate;
+    p.ammo -= 1;
+    fire(p);
+    addWanted(world, WANTED.shoot);
+  }
 }
 
-export function pointInBuilding(buildings, x, y) {
-  return buildings.some((b) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
+function stepTraffic(world, dt) {
+  for (const c of world.traffic) {
+    const vertical = Math.abs(Math.cos(c.angle)) < 0.5;
+    let blocked = false;
+    for (const o of [...world.traffic, ...world.cops.filter((k) => !k.onFoot)]) {
+      if (o === c) continue;
+      const d = dist(o, c);
+      if (d < 70) {
+        const ahead = (o.x - c.x) * Math.cos(c.angle) + (o.y - c.y) * Math.sin(c.angle);
+        if (ahead > 0 && ahead < 70) { blocked = true; break; }
+      }
+    }
+    const sp = blocked ? 0 : c.speed;
+    const nx = c.x + Math.cos(c.angle) * sp * dt;
+    const ny = c.y + Math.sin(c.angle) * sp * dt;
+    if (nx < 300 || nx > WORLD.width - 40 || ny < 40 || ny > WORLD.height - 40 || collideBuildings(world, nx, ny, 24)) {
+      // Turn around at the map edge.
+      c.angle += Math.PI;
+      continue;
+    }
+    c.x = nx; c.y = ny;
+    void vertical;
+  }
 }
 
-export function nearestRoadPoint(x, y) {
+function stepPeds(world, dt) {
+  const p = world.player;
+  for (const ped of world.peds) {
+    if (!ped.alive) continue;
+    if (ped.flee > 0) {
+      ped.flee -= dt;
+      const a = Math.atan2(ped.y - p.y, ped.x - p.x);
+      ped.x += Math.cos(a) * 150 * dt;
+      ped.y += Math.sin(a) * 150 * dt;
+    } else {
+      ped.x += Math.cos(ped.angle) * ped.speed * dt;
+      ped.y += Math.sin(ped.angle) * ped.speed * dt;
+      if (world.rng() < dt * 0.3) ped.angle = world.rng() * Math.PI * 2;
+      if (collideBuildings(world, ped.x, ped.y, 10) || ped.x < 280 || ped.x > WORLD.width - 40 || ped.y < 40 || ped.y > WORLD.height - 40) {
+        ped.angle += Math.PI / 2;
+        ped.x = Math.max(280, Math.min(WORLD.width - 40, ped.x));
+        ped.y = Math.max(40, Math.min(WORLD.height - 40, ped.y));
+      }
+    }
+    if (dist(ped, p) < 260 && world.wanted > 0) ped.flee = 2;
+  }
+}
+
+function stepCops(world, dt) {
+  const p = world.player;
+  // Spawn pressure while wanted.
+  if (world.wanted > 0) {
+    world.copTimer -= dt;
+    if (world.copTimer <= 0 && world.cops.length < Math.min(WANTED.maxCops, world.wanted + 2)) {
+      spawnCop(world, p);
+      world.copTimer = WANTED.copSpawnInterval;
+    }
+    world.heat += dt;
+    if (world.heat > WANTED.decaySeconds && world.cops.length === 0) {
+      world.wanted = Math.max(0, world.wanted - 1);
+      world.heat = 0;
+    }
+  }
+  for (const cop of world.cops) {
+    if (cop.health <= 0) continue;
+    const d = dist(cop, p);
+    if (cop.onFoot) {
+      const a = Math.atan2(p.y - cop.y, p.x - cop.x);
+      cop.angle = a;
+      const sp = 240 + world.wanted * 12;
+      cop.x += Math.cos(a) * sp * dt;
+      cop.y += Math.sin(a) * sp * dt;
+      // Foot cops shoot when close and the player is on foot.
+      if (d < 420 && !p.inCar) {
+        cop.shootTimer -= dt;
+        if (cop.shootTimer <= 0) {
+          cop.shootTimer = 1.1;
+          if (p.invulnerable <= 0) {
+            p.health -= 9;
+            world.events.push({ type: 'hurt' });
+            p.invulnerable = 0.4;
+          }
+        }
+      }
+      if (d < WANTED.bustRadius && !p.inCar && Math.hypot(p.vx, p.vy) < 60) {
+        p.busted = true;
+        world.events.push({ type: 'busted' });
+      }
+    } else {
+      // Police car: chase and ram.
+      const a = Math.atan2(p.y - cop.y, p.x - cop.x);
+      let da = a - cop.angle;
+      while (da > Math.PI) da -= Math.PI * 2;
+      while (da < -Math.PI) da += Math.PI * 2;
+      cop.angle += Math.max(-3 * dt, Math.min(3 * dt, da));
+      cop.speed = Math.min(520, (cop.speed || 0) + 420 * dt);
+      cop.x += Math.cos(cop.angle) * cop.speed * dt;
+      cop.y += Math.sin(cop.angle) * cop.speed * dt;
+      clampWorld(cop);
+      if (d < 46) {
+        if (p.inCar) {
+          p.inCar.speed *= 0.4;
+          if (p.invulnerable <= 0) { p.health -= 6; p.invulnerable = 0.5; }
+        } else if (Math.hypot(p.vx, p.vy) < 60) {
+          p.busted = true;
+          world.events.push({ type: 'busted' });
+        }
+      }
+    }
+  }
+  world.cops = world.cops.filter((c) => c.health > 0);
+}
+
+function stepBullets(world, dt) {
+  for (const b of world.bullets) {
+    b.x += Math.cos(b.angle) * b.speed * dt;
+    b.y += Math.sin(b.angle) * b.speed * dt;
+    b.life -= dt;
+    if (collideBuildings(world, b.x, b.y, 2)) b.life = 0;
+    for (const cop of world.cops) {
+      if (cop.health > 0 && dist(cop, b) < 26) {
+        cop.health -= PISTOL.damage;
+        b.life = 0;
+        if (cop.health <= 0) addWanted(world, WANTED.killCop);
+        world.events.push({ type: 'hit' });
+        break;
+      }
+    }
+    for (const ped of world.peds) {
+      if (ped.alive && dist(ped, b) < 18) {
+        ped.alive = false;
+        b.life = 0;
+        addWanted(world, WANTED.hitPed);
+        world.events.push({ type: 'hit' });
+        break;
+      }
+    }
+  }
+  world.bullets = world.bullets.filter((b) => b.life > 0 && b.x > 0 && b.x < WORLD.width && b.y > 0 && b.y < WORLD.height);
+}
+
+export function stepWorld(world, input, dt, fire) {
+  world.time += dt;
+  stepPlayer(world, input, dt, fire);
+  stepTraffic(world, dt);
+  stepPeds(world, dt);
+  stepCops(world, dt);
+  stepBullets(world, dt);
+  for (const pt of world.particles) { pt.life -= dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; }
+  world.particles = world.particles.filter((pt) => pt.life > 0);
+  const p = world.player;
+  if (p.health <= 0 && !p.dead) { p.dead = true; world.events.push({ type: 'dead' }); }
+  if (world.taxiFare) {
+    const fare = world.taxiFare;
+    if (dist(p, fare.dest) < 60) {
+      p.cash += fare.pay;
+      world.events.push({ type: 'fare', amount: fare.pay });
+      world.taxiFare = null;
+    }
+  }
+}
+
+export function nearestParked(world, x, y, maxD) {
   let best = null;
-  let bestD = Infinity;
-  for (const av of AVENUES) {
-    const d = Math.abs(x - av);
-    if (d < bestD) { bestD = d; best = { x: av, y, vertical: true }; }
-  }
-  for (const st of STREETS) {
-    const d = Math.abs(y - st);
-    if (d < bestD) { bestD = d; best = { x, y: st, vertical: false }; }
+  let bestD = maxD;
+  for (const c of world.parked) {
+    if (c.taken) continue;
+    const d = Math.hypot(c.x - x, c.y - y);
+    if (d < bestD) { bestD = d; best = c; }
   }
   return best;
 }
 
-export function randomRoadPoint(rand) {
-  if (rand() < 0.5) {
-    return { x: pick(rand, AVENUES), y: range(rand, 100, WORLD.beachY - 100), vertical: true };
+export function nearestPlace(world, x, y, maxD) {
+  let best = null;
+  let bestD = maxD;
+  for (const [id, place] of Object.entries(world.places)) {
+    const d = Math.hypot(place.x - x, place.y - y);
+    if (d < bestD) { bestD = d; best = { id, ...place }; }
   }
-  return { x: range(rand, 100, WORLD.width - 100), y: pick(rand, STREETS), vertical: false };
-}
-
-export function randomSidewalkPoint(rand) {
-  const p = randomRoadPoint(rand);
-  const off = (ROAD_W / 2 + 12) * (rand() < 0.5 ? -1 : 1);
-  if (p.vertical) return { x: p.x + off, y: p.y };
-  return { x: p.x, y: p.y + off };
+  return best;
 }

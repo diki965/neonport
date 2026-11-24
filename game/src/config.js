@@ -1,102 +1,96 @@
-// Every tuning number and colour in one place. The playfield is a fixed 1280x720
-// logical area; the renderer scales it to the window, so no rule below depends on
-// the screen size. The world is a sun-soaked coastal city, 2800x2000 units.
+// Solport — every tuning number and colour in one place.
+// The world is a fixed 2800x2000 coastal city; the renderer scales the view
+// to the window, so no rule below depends on the screen size.
 
-export const VIEW = { width: 1280, height: 720 };
+export const WORLD = { width: 2800, height: 2000 };
 
-/** The simulation's fixed step, in seconds: 60 updates a second whatever the display's rate. */
+/** The simulation's fixed step, in seconds: 60 updates a second. */
 export const STEP = 1 / 60;
 
-export const WORLD = { width: 2800, height: 2000, beachY: 1820, seaY: 1930 };
+/** Logical view size the camera frames around the player. */
+export const VIEW = { width: 1280, height: 720 };
 
 export const PLAYER = {
-  radius: 13,
-  walkSpeed: 210,
-  runSpeed: 300,
+  radius: 14,
+  walkSpeed: 230,
+  runSpeed: 330,
+  accel: 2400,
   health: 100,
-  regenDelay: 5,
-  regenRate: 3,
-  punchDamage: 22,
-  punchRange: 34,
-  punchArc: 1.1,
+  fistDamage: 34,
+  fistRange: 46,
+  fistRate: 0.45,
+};
+
+export const CAR = {
+  length: 64,
+  width: 30,
+  accel: 520,
+  brake: 900,
+  reverseAccel: 300,
+  maxSpeed: 560,
+  maxReverse: 180,
+  steer: 2.6,
+  grip: 6.5,
+  ramDamage: 26,
 };
 
 export const PISTOL = {
   damage: 34,
-  range: 460,
-  fireInterval: 0.22,
-  spread: 0.045,
+  range: 520,
+  rate: 0.28,
   magSize: 12,
-  startAmmo: 36,
-  price: 120,
+  price: 500,
   ammoPrice: 40,
-};
-
-export const CAR = {
-  // Arcade car physics: acceleration, top speed, grip, steering.
-  accel: 420,
-  brake: 700,
-  reverseAccel: 260,
-  topSpeed: 520,
-  topReverse: 180,
-  steer: 2.6,
-  grip: 3.2,
-  drag: 0.55,
-  radius: 20,
-  health: 100,
-  stealWanted: 1,
+  ammoPack: 24,
 };
 
 export const WANTED = {
-  maxStars: 5,
-  decayDelay: 10, // seconds out of police sight before a star drops
-  decayInterval: 12,
-  copCarsPerStar: 1,
-  maxCopCars: 6,
-  footCopsPerStar: 1,
-  maxFootCops: 4,
-  bustTime: 1.0, // seconds of cop contact on foot to get caught
-  sightRange: 420,
+  max: 5,
+  stealCar: 1,
+  shoot: 1,
+  hitPed: 2,
+  killCop: 2,
+  decaySeconds: 26,
+  bustRadius: 42,
+  copSpawnInterval: 4,
+  maxCops: 9,
 };
-
-export const TRAFFIC = { cars: 26, peds: 46, carSpeed: 150, pedSpeed: 55 };
 
 export const MONEY = {
-  startCash: 50,
+  start: 200,
   taxiFare: 60,
-  respray: 100,
-  repair: 50,
-  hospital: 80,
-  deathPenalty: 100,
+  healPrice: 100,
+  resprayPrice: 200,
+  sellCar: 350,
+  missionReward: [400, 500, 600, 700, 1500],
 };
 
+export const SAVE_KEY = 'solport.save.v1';
+export const BEST_KEY = 'solport.best';
+
 export const PALETTE = {
-  sky: '#8ec9ee',
-  grass: '#7ec850',
-  sand: '#f2dd9e',
-  sea: '#2f9fd8',
-  seaDeep: '#1f7fb8',
-  road: '#3a3f4a',
-  roadEdge: '#2c3038',
-  sidewalk: '#b9bec7',
-  crosswalk: '#e8eaf0',
-  lane: '#f5d76e',
-  buildingRoof: '#8a6f5c',
-  panel: 'rgba(12, 16, 24, 0.82)',
-  panelEdge: '#ffd166',
-  text: '#f4f6f8',
-  muted: '#aab4c0',
-  gold: '#ffd166',
+  sea: '#2e7f9e',
+  sand: '#e8d39a',
+  grass: '#5d8a4a',
+  road: '#33373d',
+  roadLine: '#d8c25a',
+  sidewalk: '#8d8578',
+  building: ['#b0563e', '#c07a3e', '#7d8aa0', '#a03e5c', '#4e7d6b', '#8a6fb0', '#5b7fa6'],
+  roof: ['#6e3a2c', '#54423a', '#3a4a5a'],
+  player: '#f2c94c',
+  playerShirt: '#2e86de',
+  ped: ['#e74c3c', '#9b59b6', '#1abc9c', '#e67e22', '#ecf0f1', '#f39c12'],
+  cop: '#24344d',
+  copCar: '#1f2a3a',
+  taxi: '#f5c542',
+  carColors: ['#c0392b', '#2980b9', '#27ae60', '#8e44ad', '#e67e22', '#16a085', '#d5dbdb', '#7f8c8d'],
+  hud: '#10141b',
+  panel: 'rgba(12,16,22,0.86)',
+  text: '#eef1f5',
+  muted: '#9aa4b2',
   star: '#ffd94d',
-  health: '#58d68d',
-  danger: '#ff5d5d',
-  police: '#3f8cff',
-  mission: '#ff9f1c',
-  taxi: '#ffe135',
+  marker: '#ffcf3d',
+  bank: '#c9a227',
 };
 
 export const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
-
-/** Where the save is kept between visits (this browser only). */
-export const SAVE_KEY = 'solport.save.v1';
-export const BEST_KEY = 'solport.best.v1';

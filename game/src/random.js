@@ -1,8 +1,10 @@
-// A small seeded random number generator (mulberry32): the same seed gives the
-// same city, which is what makes the screenshot scenes repeatable.
-export function createRandom(seed) {
-  let a = seed | 0;
-  return function random() {
+// Seeded random numbers (mulberry32) so a staged screenshot with a fixed
+// seed always shows the same city, traffic and pedestrians.
+
+export function makeRng(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
     a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
@@ -10,33 +12,25 @@ export function createRandom(seed) {
   };
 }
 
-export function pick(rand, arr) {
-  return arr[Math.floor(rand() * arr.length)];
+export function pick(rng, list) {
+  return list[Math.floor(rng() * list.length) % list.length];
 }
 
-export function range(rand, min, max) {
-  return min + rand() * (max - min);
+export function range(rng, min, max) {
+  return min + rng() * (max - min);
 }
 
-export function int(rand, min, max) {
-  return Math.floor(range(rand, min, max + 1));
+export function intRange(rng, min, max) {
+  return min + Math.floor(rng() * (max - min + 1));
 }
 
-export function clamp(v, lo, hi) {
-  return v < lo ? lo : v > hi ? hi : v;
-}
-
-export function lerp(a, b, t) {
-  return a + (b - a) * t;
-}
-
-export function angleLerp(a, b, t) {
-  let d = b - a;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return a + d * t;
-}
-
-export function dist(x1, y1, x2, y2) {
-  return Math.hypot(x2 - x1, y2 - y1);
+export function shuffle(rng, list) {
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = out[i];
+    out[i] = out[j];
+    out[j] = tmp;
+  }
+  return out;
 }

@@ -1,121 +1,100 @@
-// Screenshot scenes, driven by ?shot= in the URL. Each one stages a real
-// game state — the same code path the player uses — so the screenshots are
-// renders of the game itself, never composited. Used by the maker's shot
-// script and by nothing else.
-import { WORLD } from './config.js';
+// Staged screenshots behind ?shot=title|chase|mission|play. Each one plays
+// the real rules forward from a fresh world for a fixed number of steps,
+// steered by a simple autopilot, so the frame is what real play looks like
+// and the same seed always gives the same frame.
 
-export function stageShot(G, shot) {
-  const E = G.entities;
-  const M = G.missions;
-  const L = G.world.locations;
-  const p = E.player;
+import { STEP } from './config.js';
+import { startMission } from './missions.js';
+import { nearestParked, addWanted } from './world.js';
+import { SCREEN_TITLE, SCREEN_PLAY } from './render.js';
 
-  if (shot === 'start') {
-    G.state = 'title';
-    return;
+/**
+ * Steer toward a point: returns held keys. On foot the keys are the screen
+ * direction itself; in a car the angle grows clockwise (y is down), so a
+ * target clockwise of the heading needs the RIGHT key.
+ */
+function steerToward(world, tx, ty) {
+  const p = world.player;
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  if (Math.hypot(dx, dy) < 60) return {};
+  if (!p.inCar) {
+    const held = {};
+    if (dy < -20) held.up = true;
+    else if (dy > 20) held.down = true;
+    if (dx < -20) held.left = true;
+    else if (dx > 20) held.right = true;
+    return held;
   }
-
-  G.state = 'play';
-  G.cash = 1240;
-  if (shot === 'play') {
-    // Cover: Rico in the red sports car, mid-chase, three stars, two cop cars
-    // behind, mission 2 running, the minimap full of blue dots.
-    M.startMission(1);
-    M.dialogue = null;
-    M.step = 1;
-    M.stepTimer = 12;
-    const car = E.cars.find((c) => c.color === '#e74c3c' && c.type.name === 'Sports');
-    if (car) {
-      car.driver = 'player';
-      p.inCar = car;
-      car.x = 1400;
-      car.y = 1100;
-      car.angle = Math.PI / 2; // south down the avenue, clear stretch
-      car.speed = 420;
-      p.x = car.x;
-      p.y = car.y;
-      p.angle = car.angle;
-    }
-    p.hp = 100;
-    G.wanted = 3;
-    G.wantedTimer = 0;
-    const cop1 = E.spawnCopCar(p.x, p.y);
-    cop1.x = p.x - 30;
-    cop1.y = p.y - 260;
-    cop1.angle = Math.PI / 2;
-    cop1.speed = 430;
-    const cop2 = E.spawnCopCar(p.x, p.y);
-    cop2.x = p.x + 40;
-    cop2.y = p.y - 330;
-    cop2.angle = Math.PI / 2;
-    cop2.speed = 430;
-  } else if (shot === 'foot') {
-    // On foot on a busy avenue: traffic, pedestrians, the Gun Barn ahead.
-    M.startMission(0);
-    M.dialogue = null;
-    p.x = 1000;
-    p.y = 1560;
-    p.angle = -Math.PI / 2;
-    p.hasPistol = true;
-    p.weapon = 'pistol';
-    p.ammo = 12;
-    p.reserveAmmo = 24;
-    G.wanted = 0;
-    for (let i = 0; i < 6; i++) {
-      const ped = E.peds[i];
-      if (ped) {
-        ped.x = 920 + i * 44;
-        ped.y = 1470 + (i % 3) * 55;
-        ped.state = 'walk';
-      }
-    }
-    G.camera.x = p.x;
-    G.camera.y = p.y;
-  } else if (shot === 'mission') {
-    // Mission 5: outside the bank with the vault cracked, four stars, cops
-    // closing in, the safehouse marker on the map.
-    M.startMission(4);
-    M.dialogue = null;
-    M.step = 1;
-    M.vaultHeat = true;
-    p.x = L.bank.x;
-    p.y = L.bank.y + 110;
-    p.angle = Math.PI / 2;
-    p.hasPistol = true;
-    p.weapon = 'pistol';
-    p.ammo = 9;
-    p.reserveAmmo = 12;
-    p.hp = 72;
-    G.wanted = 4;
-    G.cash = 2740;
-    const cop1 = E.spawnCopCar(p.x, p.y);
-    cop1.x = p.x + 420;
-    cop1.y = p.y - 140;
-    cop1.speed = 400;
-    const cop2 = E.spawnCopCar(p.x, p.y);
-    cop2.x = p.x - 380;
-    cop2.y = p.y + 160;
-    cop2.speed = 400;
-    E.spawnFootCop(p.x + 180, p.y + 90);
-  }
-  // Let one frame of traffic settle before the shot is taken, then put the
-  // camera on the player — the settle steps move the cars, so centring the
-  // camera first would leave the player off-screen.
-  for (let i = 0; i < 30; i++) {
-    E.update(1 / 60, { ...G, input: G.input, hooks: G.hooks, world: G.world, wanted: G.wanted, mouseWorld: G.mouseWorld, policeSight: () => false });
-  }
-  // The settle steps can bounce the player's car off crossing traffic; put
-  // it back at chase speed so the shot reads as a chase, not a pile-up.
-  if (p.inCar) p.inCar.speed = 380;
-  for (const c of E.cars) if (c.driver === 'police') c.speed = 400;
-  G.camera.x = clampCam(p.x, p);
-  G.camera.y = clampCamY(p.y, p);
+  const want = Math.atan2(dy, dx);
+  let da = want - p.angle;
+  while (da > Math.PI) da -= Math.PI * 2;
+  while (da < -Math.PI) da += Math.PI * 2;
+  const held = { up: true };
+  if (da > 0.35) held.right = true;
+  else if (da < -0.35) held.left = true;
+  return held;
 }
 
-function clampCam(x, p) {
-  return Math.max(640, Math.min(WORLD.width - 640, x));
-}
+/**
+ * Set `world` to the named scene and return the screen to draw over it.
+ * `stepFn` is the world's step function (stepWorld with a fire callback).
+ */
+export function stageShot(name, world, stepFn) {
+  const run = (seconds, steer) => {
+    const input = { held: {}, pressed: {}, mouse: { x: 640, y: 360, down: false, clicked: false } };
+    for (let i = 0; i < seconds / STEP; i += 1) {
+      input.held = steer(i);
+      input.pressed = {};
+      world.events.length = 0;
+      stepFn(world, input, STEP);
+    }
+  };
 
-function clampCamY(y, p) {
-  return Math.max(360, Math.min(WORLD.height - 360, y));
+  if (name === 'chase') {
+    // Rico in a stolen car at 3 stars, cops in pursuit, mid-chase.
+    const car = nearestParked(world, 1400, 1000, 100000);
+    car.taken = true;
+    world.player.inCar = car;
+    world.player.x = car.x;
+    world.player.y = car.y;
+    car.speed = 300;
+    addWanted(world, 3);
+    startMission(world, 0);
+    world.mission.line = world.mission.dialogue.length - 1;
+    run(16, () => steerToward(world, 2300, 1400));
+    return { screen: SCREEN_PLAY };
+  }
+
+  if (name === 'mission') {
+    // Mission 5 at the Bank of Solport: on foot, 4 stars, a foot cop closing in.
+    startMission(world, 4);
+    world.mission.line = world.mission.dialogue.length - 1;
+    world.player.x = world.places.bank.x - 260;
+    world.player.y = world.places.bank.y + 120;
+    world.player.hasPistol = true;
+    world.player.ammo = 12;
+    addWanted(world, 4);
+    run(7, () => steerToward(world, world.places.bank.x, world.places.bank.y));
+    return { screen: SCREEN_PLAY };
+  }
+
+  if (name === 'play') {
+    // Mission 1: driving the stolen car toward the Garage.
+    const car = nearestParked(world, 700, 1200, 100000);
+    car.taken = true;
+    world.player.inCar = car;
+    world.player.x = car.x;
+    world.player.y = car.y;
+    car.speed = 260;
+    addWanted(world, 1);
+    startMission(world, 0);
+    world.mission.line = world.mission.dialogue.length - 1;
+    run(13, () => steerToward(world, world.places.garage.x, world.places.garage.y));
+    return { screen: SCREEN_PLAY };
+  }
+
+  // Title: the city alive for a few seconds behind the title screen.
+  run(5, () => ({}));
+  return { screen: SCREEN_TITLE };
 }

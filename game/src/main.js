@@ -1,463 +1,424 @@
-// Solport: the boot, the loop, the state machine and every rule that ties the
-// modules together — wanted decay, shops, saves, dialogue, menus and the
-// camera. The world itself lives in world.js, the actors in entities.js, the
-// story in missions.js and all drawing in render.js.
-import { VIEW, STEP, WORLD, WANTED, MONEY, PISTOL } from './config.js';
-import { createRandom, clamp, dist } from './random.js';
-import { createWorld } from './world.js';
+// Solport — entry point. Fixed-step simulation, screens, save/load, shops,
+// missions, and staged screenshots (?shot=title|chase|mission|play&seed=N).
+// The frame body is wrapped in try/finally so input.endFrame() always runs:
+// an exception mid-frame used to stick keys down forever.
+
+import { STEP, VIEW, SAVE_KEY, BEST_KEY, PISTOL, MONEY, WORLD } from './config.js';
+import { createWorld, stepWorld, nearestParked, nearestPlace, addWanted } from './world.js';
 import { createInput } from './input.js';
 import { createAudio } from './audio.js';
-import { createEntities } from './entities.js';
-import { createMissions } from './missions.js';
-import { createRenderer } from './render.js';
-import { hasSave, saveGame, loadSave, clearSave } from './save.js';
+import {
+  renderWorld, renderHud, renderTitle, renderDialogue, renderShop, renderCenter,
+  SCREEN_TITLE, SCREEN_PLAY, SCREEN_OVER, SCREEN_BUSTED, SCREEN_WIN,
+} from './render.js';
+import { startMission, advanceDialogue, missionDone, MISSIONS } from './missions.js';
 import { stageShot } from './shots.js';
 
 const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
 canvas.width = VIEW.width;
 canvas.height = VIEW.height;
 const statusEl = document.getElementById('status');
 
-const input = createInput(canvas);
+const params = new URLSearchParams(window.location.search);
+const seed = parseInt(params.get('seed') || '1', 10) || 1;
+const shotName = params.get('shot');
+
+const input = createInput();
+input.attach(canvas);
 const audio = createAudio();
-const world = createWorld(20261122);
-const entities = createEntities(world, audio);
-const missions = createMissions(world, entities);
-const render = createRenderer(canvas);
+const world = createWorld(seed);
 
-const G = {
-  state: 'title',
-  time: 0,
-  cash: MONEY.startCash,
-  wanted: 0,
-  wantedTimer: 0,
-  unseenTimer: 0,
-  camera: { x: world.locations.safehouse.x, y: world.locations.safehouse.y },
-  toast: '',
-  toastT: 0,
-  showHelp: false,
-  hasSave: hasSave(),
-  lastMission: null,
-  failReason: '',
-  hintT: 0,
-  input, audio, world, entities, missions,
-  hooks: null,
-  mouseWorld: null,
-  policeSight: null,
+// Debug handle for automated checks (harmless in normal play).
+window.__solport = { world, game: null, input };
+
+const game = {
+  screen: SCREEN_TITLE,
+  paused: false,
+  toasts: [],
+  best: 0,
+  shop: null,
+  missionIndex: 0,
+  cam: { x: world.player.x, y: world.player.y },
+  titleButtons: [],
+  saveData: null,
+  world,
 };
 
-G.mouseWorld = () => {
-  const sx = input.mouseX;
-  const sy = input.mouseY;
-  return { x: G.camera.x - VIEW.width / 2 + sx, y: G.camera.y - VIEW.height / 2 + sy };
-};
+try { game.best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; } catch (e) { /* private mode */ }
+try { game.saveData = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null'); } catch (e) { game.saveData = null; }
+window.__solport.game = game;
 
-G.policeSight = () => {
-  const p = entities.player;
-  for (const c of entities.cars) {
-    if (c.driver === 'police' && !c.dead && dist(c.x, c.y, p.x, p.y) < WANTED.sightRange) return true;
+function toast(text, color) {
+  game.toasts.push({ text, color: color || '#eef1f5', t: 3 });
+  if (game.toasts.length > 3) game.toasts.shift();
+}
+
+function setStatus(text) {
+  if (statusEl) statusEl.textContent = text;
+}
+
+function layoutTitleButtons() {
+  const labels = ['NEW GAME'];
+  if (game.saveData) labels.push('CONTINUE');
+  labels.push('HOW TO PLAY');
+  game.titleButtons = labels.map((label, i) => ({
+    label,
+    x: VIEW.width / 2 - 150,
+    y: 380 + i * 62,
+    w: 300,
+    h: 48,
+    hover: false,
+  }));
+}
+layoutTitleButtons();
+
+function saveGame() {
+  const p = world.player;
+  const data = {
+    cash: p.cash, health: p.health, hasPistol: p.hasPistol, ammo: p.ammo,
+    missionIndex: game.missionIndex, wanted: world.wanted, x: p.x, y: p.y,
+  };
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(data)); } catch (e) { /* private mode */ }
+  game.saveData = data;
+  layoutTitleButtons();
+}
+
+function loadSave(data) {
+  const p = world.player;
+  p.cash = data.cash;
+  p.health = data.health;
+  p.hasPistol = data.hasPistol;
+  p.ammo = data.ammo;
+  p.x = data.x;
+  p.y = data.y;
+  world.wanted = 0;
+  world.cops = [];
+  game.missionIndex = data.missionIndex || 0;
+  startMission(world, game.missionIndex);
+  world.mission.line = world.mission.dialogue.length - 1;
+  game.cam.x = p.x;
+  game.cam.y = p.y;
+}
+
+function beginMission(index) {
+  game.missionIndex = index;
+  startMission(world, index);
+  game.screen = 'dialogue';
+  setStatus(MISSIONS[index].briefing);
+}
+
+function fireBullet(p) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = VIEW.width / rect.width;
+  const scaleY = VIEW.height / rect.height;
+  const mx = (input.mouse.x * scaleX - VIEW.width / 2) + game.cam.x;
+  const my = (input.mouse.y * scaleY - VIEW.height / 2) + game.cam.y;
+  const angle = Math.atan2(my - p.y, mx - p.x);
+  world.bullets.push({ x: p.x + Math.cos(angle) * 22, y: p.y + Math.sin(angle) * 22, angle, speed: 900, life: 1.1 });
+  world.particles.push({ x: p.x + Math.cos(angle) * 26, y: p.y + Math.sin(angle) * 26, vx: Math.cos(angle) * 120, vy: Math.sin(angle) * 120, life: 0.15, color: '#ffe66d' });
+  audio.shot();
+}
+
+function openShop(id) {
+  const p = world.player;
+  const defs = {
+    gunbarn: {
+      title: 'Gun Barn',
+      items: [
+        { label: 'Pistol', price: PISTOL.price, buy() { if (p.cash >= PISTOL.price && !p.hasPistol) { p.cash -= PISTOL.price; p.hasPistol = true; p.ammo = PISTOL.magSize; return 'Pistol bought'; } return p.hasPistol ? 'Already armed' : 'Not enough cash'; } },
+        { label: 'Ammo pack (24 rds)', price: PISTOL.ammoPrice, buy() { if (!p.hasPistol) return 'Buy the pistol first'; if (p.cash < PISTOL.ammoPrice) return 'Not enough cash'; p.cash -= PISTOL.ammoPrice; p.ammo += PISTOL.ammoPack; return 'Ammo +24'; } },
+      ],
+    },
+    clinic: {
+      title: 'Clinic',
+      items: [
+        { label: 'Patch up (full health)', price: MONEY.healPrice, buy() { if (p.cash < MONEY.healPrice) return 'Not enough cash'; if (p.health >= 100) return 'Already healthy'; p.cash -= MONEY.healPrice; p.health = 100; return 'Patched up'; } },
+      ],
+    },
+    respray: {
+      title: 'Respray',
+      items: [
+        { label: 'New paint — lose the heat', price: MONEY.resprayPrice, buy() { if (p.cash < MONEY.resprayPrice) return 'Not enough cash'; if (world.wanted === 0) return 'No heat to lose'; p.cash -= MONEY.resprayPrice; world.wanted = 0; world.cops = []; world.heat = 0; return 'Clean. The cops lost you.'; } },
+      ],
+    },
+    garage: {
+      title: 'Garage',
+      items: [
+        { label: 'Sell this car', price: -MONEY.sellCar, buy() { if (!p.inCar) return 'Bring a car to sell'; const car = p.inCar; p.inCar = null; car.taken = true; p.cash += MONEY.sellCar; return 'Sold for $' + MONEY.sellCar; } },
+      ],
+    },
+  };
+  const def = defs[id];
+  if (!def) return;
+  game.shop = { id, title: def.title, items: def.items, selected: 0, message: '', messageColor: '#2ecc71' };
+  game.screen = 'shop';
+}
+
+function buySelected() {
+  const shop = game.shop;
+  if (!shop) return;
+  const item = shop.items[shop.selected];
+  const result = item.buy();
+  shop.message = result;
+  shop.messageColor = result.includes('Not enough') || result.includes('first') || result.includes('Already') || result.includes('Bring') || result.includes('No heat') ? '#e74c3c' : '#2ecc71';
+  if (shop.messageColor === '#2ecc71') audio.cash();
+}
+
+function interact() {
+  const p = world.player;
+  if (p.dead || p.busted) return;
+  const place = nearestPlace(world, p.x, p.y, 90);
+  if (place) {
+    if (place.id === 'safehouse') {
+      p.health = 100;
+      saveGame();
+      toast('Game saved at the Safehouse', '#2ecc71');
+      audio.pickup();
+      return;
+    }
+    openShop(place.id);
+    return;
   }
-  for (const c of entities.footCops) {
-    if (!c.dead && dist(c.x, c.y, p.x, p.y) < WANTED.sightRange) return true;
+  const car = nearestParked(world, p.x, p.y, 70);
+  if (car && !p.inCar) {
+    toast('Press F to get in the car', '#ffe9a8');
   }
-  return false;
-};
-
-function showToast(text, dur = 3) {
-  G.toast = text;
-  G.toastT = dur;
 }
 
-function setWanted(n) {
-  G.wanted = clamp(n, 0, WANTED.maxStars);
-  G.unseenTimer = 0;
-  G.wantedTimer = 0;
-}
-
-function startMission(i) {
-  missions.startMission(i);
-  const m = missions.defs[i];
-  if (m.id === 'heat') setWanted(3);
-}
-
-G.hooks = {
-  onCrime: (type, stars) => {
-    if (stars > 0) {
-      setWanted(G.wanted + stars);
-      G.unseenTimer = 0;
-    }
-  },
-  onCarStolen: () => showToast('Car stolen — the city saw that'),
-  onPedDown: () => {},
-  onExplosion: (x, y) => {
-    if (dist(x, y, entities.player.x, entities.player.y) < 500) G.hooks.onCrime('explosion', 1);
-  },
-  onPickup: (kind) => showToast(kind === 'health' ? 'Health restored' : 'Ammo picked up'),
-  onCash: (amount) => {
-    G.cash += amount;
-    audio.cash();
-    showToast(`+$${amount}`);
-  },
-  onMissionComplete: (m) => {
-    audio.missionDone();
-    G.lastMission = m;
-    G.state = 'missioncard';
-    saveGame(G);
-  },
-  onMissionFailed: (m, reason) => {
-    audio.missionFail();
-    G.failReason = reason;
-    G.state = 'failed';
-  },
-  onBusted: () => {
-    const p = entities.player;
-    if (p.inCar) entities.exitCar();
-    G.cash = Math.max(0, G.cash - MONEY.deathPenalty);
-    setWanted(0);
-    p.hp = 100;
-    p.dead = false;
-    p.x = world.locations.safehouse.x;
-    p.y = world.locations.safehouse.y + 60;
-    const m = missions.current();
-    if (m) {
-      missions.active = false;
-      missions.failed = true;
-    }
-    audio.setEngine(false, 0);
-    G.state = 'busted';
-  },
-  onDown: () => {
-    const p = entities.player;
-    G.cash = Math.max(0, G.cash - MONEY.deathPenalty);
-    setWanted(0);
-    p.hp = 100;
-    p.dead = false;
-    p.x = world.locations.clinic.x;
-    p.y = world.locations.clinic.y + 70;
-    const m = missions.current();
-    if (m) {
-      missions.active = false;
-      missions.failed = true;
-    }
-    audio.setEngine(false, 0);
-    G.state = 'down';
-  },
-  onTaxiPickup: () => showToast('Passenger aboard — follow the yellow marker'),
-  onTaxiDone: (fare) => showToast(`Taxi fare paid: $${fare}`),
-  onVaultCracked: () => {
-    setWanted(4);
-    showToast('Vault cracked! The whole force is coming — RUN');
-  },
-};
-
-function newGame() {
-  clearSave();
-  resetRun();
-  G.cash = MONEY.startCash;
-  G.state = 'play';
-  G.hintT = 25;
-  startMission(0);
-  audio.ensure();
-  audio.startMusic();
-}
-
-function resetRun() {
-  const p = entities.player;
-  p.x = world.locations.safehouse.x;
-  p.y = world.locations.safehouse.y + 60;
-  p.hp = 100;
-  p.dead = false;
-  p.hasPistol = false;
-  p.weapon = 'fists';
-  p.ammo = 0;
-  p.reserveAmmo = 0;
+function enterExitCar() {
+  const p = world.player;
+  if (p.dead || p.busted) return;
   if (p.inCar) {
-    p.inCar.driver = 'none';
+    const car = p.inCar;
     p.inCar = null;
-  }
-  setWanted(0);
-  missions.index = 0;
-  missions.step = 0;
-  missions.active = false;
-  missions.dialogue = null;
-  missions.taxi = null;
-  G.camera.x = p.x;
-  G.camera.y = p.y;
-  audio.setEngine(false, 0);
-}
-
-function continueGame() {
-  const s = loadSave();
-  if (!s) return;
-  resetRun();
-  G.cash = s.cash;
-  const p = entities.player;
-  p.hp = s.hp;
-  p.hasPistol = s.hasPistol;
-  p.ammo = s.ammo;
-  p.reserveAmmo = s.reserveAmmo;
-  if (p.hasPistol) p.weapon = 'pistol';
-  G.state = 'play';
-  G.hintT = 12;
-  startMission(Math.min(s.missionIndex, 4));
-  audio.ensure();
-  audio.startMusic();
-}
-
-function retryMission() {
-  const i = missions.index;
-  resetRun();
-  G.state = 'play';
-  startMission(Math.min(i, 4));
-}
-
-// --- shops and safehouse -----------------------------------------------------
-function updateShops(dt) {
-  const p = entities.player;
-  const L = world.locations;
-  const near = (loc, r) => dist(p.x, p.y, loc.x, loc.y + 70) < r;
-
-  if (!p.inCar && near(L.gunstore, 70)) {
-    if (!p.hasPistol) {
-      showToast('Gun Barn — press E to buy a pistol ($120)', 0.2);
-      if (input.wasPressed('e')) {
-        if (G.cash >= PISTOL.price) {
-          G.cash -= PISTOL.price;
-          p.hasPistol = true;
-          p.weapon = 'pistol';
-          p.ammo = PISTOL.magSize;
-          p.reserveAmmo = PISTOL.startAmmo;
-          audio.pickup();
-          showToast('Pistol bought — press 2 to draw it, click to fire');
-        } else {
-          audio.deny();
-          showToast('Not enough cash for a pistol');
-        }
-      }
-    } else {
-      showToast('Gun Barn — press E for ammo ($40)', 0.2);
-      if (input.wasPressed('e')) {
-        if (G.cash >= PISTOL.ammoPrice) {
-          G.cash -= PISTOL.ammoPrice;
-          p.reserveAmmo += PISTOL.magSize;
-          audio.pickup();
-          showToast('Ammo bought');
-        } else {
-          audio.deny();
-          showToast('Not enough cash for ammo');
-        }
-      }
-    }
-  }
-
-  if (!p.inCar && near(L.clinic, 70) && p.hp < 100) {
-    showToast('Clinic — press E to heal ($80)', 0.2);
-    if (input.wasPressed('e') && G.cash >= MONEY.hospital) {
-      G.cash -= MONEY.hospital;
-      p.hp = 100;
-      audio.pickup();
-      showToast('Patched up — full health');
-    }
-  }
-
-  if (p.inCar && near(L.respray, 80) && G.wanted > 0) {
-    showToast('Respray — press E for a new paint job ($100, clears wanted)', 0.2);
-    if (input.wasPressed('e') && G.cash >= MONEY.respray) {
-      G.cash -= MONEY.respray;
-      setWanted(0);
-      p.inCar.hp = 100;
-      p.inCar.smoking = false;
-      p.inCar.color = ['#e74c3c', '#3498db', '#f1c40f', '#1abc9c'][Math.floor(Math.random() * 4)];
-      audio.pickup();
-      showToast('Fresh paint — the police lost you');
-    }
-  }
-
-  if (p.inCar && near(L.garage, 80) && p.inCar.hp < 100) {
-    showToast("Rosa's Garage — press E to repair ($50)", 0.2);
-    if (input.wasPressed('e') && G.cash >= MONEY.repair) {
-      G.cash -= MONEY.repair;
-      p.inCar.hp = 100;
-      p.inCar.smoking = false;
-      audio.pickup();
-      showToast('Car repaired');
-    }
-  }
-
-  if (!p.inCar && near(L.safehouse, 70)) {
-    if (saveGame(G)) showToast('Game saved at the safehouse', 0.2);
-  }
-
-  // Reload from reserve with R.
-  if (input.wasPressed('r') && p.hasPistol && p.weapon === 'pistol' && p.reserveAmmo > 0 && p.ammo < PISTOL.magSize) {
-    const need = PISTOL.magSize - p.ammo;
-    const take = Math.min(need, p.reserveAmmo);
-    p.ammo += take;
-    p.reserveAmmo -= take;
-    audio.pickup();
-  }
-}
-
-// --- wanted decay -------------------------------------------------------------
-function updateWanted(dt) {
-  if (G.wanted === 0) return;
-  if (G.policeSight()) {
-    G.unseenTimer = 0;
-    G.wantedTimer = 0;
-  } else {
-    G.unseenTimer += dt;
-    if (G.unseenTimer > WANTED.decayDelay) {
-      G.wantedTimer += dt;
-      if (G.wantedTimer >= WANTED.decayInterval) {
-        G.wantedTimer = 0;
-        setWanted(G.wanted - 1);
-        if (G.wanted === 0) showToast('The heat is off — for now');
-      }
-    }
-  }
-}
-
-// --- camera -------------------------------------------------------------------
-function updateCamera(dt) {
-  const p = entities.player;
-  const look = p.inCar ? 0.35 : 0.18;
-  const tx = p.x + Math.cos(p.angle) * (p.inCar ? p.inCar.speed * look : p.speed * look);
-  const ty = p.y + Math.sin(p.angle) * (p.inCar ? p.inCar.speed * look : p.speed * look);
-  G.camera.x += (tx - G.camera.x) * clamp(4 * dt, 0, 1);
-  G.camera.y += (ty - G.camera.y) * clamp(4 * dt, 0, 1);
-  G.camera.x = clamp(G.camera.x, VIEW.width / 2, WORLD.width - VIEW.width / 2);
-  G.camera.y = clamp(G.camera.y, VIEW.height / 2, WORLD.height - VIEW.height / 2);
-}
-
-// --- buttons ------------------------------------------------------------------
-function clickButton(label) {
-  const b = render.buttons.find((btn) => btn.label === label && btn.enabled);
-  if (!b) return false;
-  return input.mouseX >= b.x && input.mouseX <= b.x + b.w && input.mouseY >= b.y && input.mouseY <= b.y + b.h;
-}
-
-function updateMenus() {
-  if (G.state === 'title') {
-    if (input.mousePressed) {
-      if (clickButton('NEW GAME')) newGame();
-      else if (clickButton('CONTINUE') && G.hasSave) continueGame();
-      else if (clickButton('HOW TO PLAY')) G.showHelp = true;
-      else if (clickButton('CLOSE')) G.showHelp = false;
-    }
+    p.x = car.x + Math.cos(car.angle + Math.PI / 2) * 44;
+    p.y = car.y + Math.sin(car.angle + Math.PI / 2) * 44;
     return;
   }
-  if (G.state === 'pause') {
-    if (input.mousePressed) {
-      if (clickButton('RESUME')) G.state = 'play';
-      else if (clickButton('SAVE GAME')) {
-        if (saveGame(G)) showToast('Game saved');
-        G.state = 'play';
-      } else if (clickButton('QUIT TO TITLE')) {
-        G.state = 'title';
-        G.hasSave = hasSave();
-      }
+  const car = nearestParked(world, p.x, p.y, 70);
+  if (car) {
+    car.taken = true;
+    p.inCar = car;
+    p.x = car.x;
+    p.y = car.y;
+    addWanted(world, 1);
+    toast(car.taxi ? 'Taxi taken — drive to the marker for the fare' : 'Car stolen — the cops noticed', '#ffd94d');
+    if (car.taxi) {
+      const dests = Object.values(world.places);
+      const dest = dests[Math.floor(Math.random() * dests.length)];
+      world.taxiFare = { dest: { x: dest.x, y: dest.y }, pay: MONEY.taxiFare };
+      if (world.mission) world.mission.target = world.taxiFare.dest;
     }
-    return;
-  }
-  if (G.state === 'missioncard') {
-    if (input.mousePressed && clickButton('CONTINUE')) G.state = 'play';
-    return;
-  }
-  if (G.state === 'down' || G.state === 'busted' || G.state === 'failed') {
-    if (input.mousePressed) {
-      if (clickButton('TRY AGAIN')) retryMission();
-      else if (clickButton('QUIT TO TITLE')) {
-        G.state = 'title';
-        G.hasSave = hasSave();
-      }
-    }
+    audio.blip(440, 0.1, 'square', 0.08);
   }
 }
 
-// --- main loop ------------------------------------------------------------------
-let last = performance.now();
-let acc = 0;
+function drainEvents() {
+  for (const ev of world.events) {
+    if (ev.type === 'fare') { toast('Taxi fare +$' + ev.amount, '#2ecc71'); audio.cash(); }
+    else if (ev.type === 'drop') { toast('Package delivered', '#2ecc71'); audio.pickup(); }
+    else if (ev.type === 'collect') { toast('Collected $150', '#2ecc71'); audio.cash(); }
+    else if (ev.type === 'grab') { toast('Vault cash grabbed — RUN!', '#e74c3c'); audio.jingle(); }
+    else if (ev.type === 'busted') { audio.busted(); }
+    else if (ev.type === 'hurt') { audio.blip(200, 0.08, 'sawtooth', 0.06); }
+    else if (ev.type === 'pedDown') { toast('Pedestrian down — wanted up', '#e74c3c'); }
+  }
+  world.events.length = 0;
+}
 
-function frame(now) {
-  requestAnimationFrame(frame);
+function step(dt) {
+  // Edge-triggered input (pressed keys, clicks) is consumed by the first
+  // step that runs after it arrives, and cleared here — never by a frame
+  // that runs no step, or presses get lost between frames.
   try {
-  let dt = (now - last) / 1000;
-  last = now;
-  if (dt > 0.25) dt = 0.25;
-  acc += dt;
-
-  // Global keys.
-  if (input.wasPressed('m')) {
-    const muted = audio.toggleMute();
-    showToast(muted ? 'Sound off' : 'Sound on');
-  }
-  if ((input.wasPressed('p') || input.wasPressed('escape')) && (G.state === 'play' || G.state === 'pause')) {
-    G.state = G.state === 'play' ? 'pause' : 'play';
-  }
-
-  let steps = 0;
-  while (acc >= STEP && steps < 5) {
-    acc -= STEP;
-    steps += 1;
-    G.time += STEP;
-
-    if (G.state === 'title' || G.state === 'pause') {
-      // Frozen world; menus still animate with G.time.
-    } else if (G.state === 'play') {
-      if (missions.dialogue) {
-        if (input.wasPressed('e') || input.mousePressed) {
-          // Consume the click: several fixed steps can run in one frame and
-          // each would otherwise advance the dialogue a line.
-          input.mousePressed = false;
-          missions.advanceDialogue();
-        }
-      } else {
-        entities.update(STEP, G);
-        missions.update(STEP, G);
-        updateWanted(STEP);
-        updateShops(STEP);
-        updateCamera(STEP);
-        G.hintT = Math.max(0, G.hintT - STEP);
-        if (entities.player.dead) audio.setEngine(false, 0);
-        else if (!entities.player.inCar) audio.setEngine(false, 0);
-      }
+  if (game.screen === 'dialogue') {
+    if (input.pressed.interact || input.mouse.clicked) {
+      const more = advanceDialogue(world);
+      if (!more) game.screen = SCREEN_PLAY;
+      audio.blip(660, 0.05, 'sine', 0.06);
     }
-    if (G.toastT > 0) G.toastT -= STEP;
-    // One press must fire once per frame, not once per fixed step: clear the
-    // pressed set after the first step so later steps in this frame see a
-    // clean slate. (Keys are only added by event listeners, which run between
-    // frames, so nothing is lost.)
-    if (steps === 1) input.pressed.clear();
+    return;
+  }
+  if (game.screen === 'shop') {
+    const shop = game.shop;
+    if (input.pressed.up) shop.selected = (shop.selected + shop.items.length - 1) % shop.items.length;
+    if (input.pressed.down) shop.selected = (shop.selected + 1) % shop.items.length;
+    if (input.pressed.confirm) buySelected();
+    if (input.pressed.interact || input.pressed.pause) game.screen = SCREEN_PLAY;
+    return;
+  }
+  if (game.screen !== SCREEN_PLAY) return;
+
+  if (input.pressed.pause) { game.paused = !game.paused; return; }
+  if (game.paused) return;
+  if (input.pressed.mute) { const m = audio.toggleMute(); toast(m ? 'Muted' : 'Sound on'); return; }
+  if (input.pressed.interact) interact();
+  if (input.pressed.enter) enterExitCar();
+
+  stepWorld(world, input, dt, fireBullet);
+  drainEvents();
+
+  // Mission progress.
+  if (world.mission) {
+    const done = missionDone(world);
+    if (done === 'fail') {
+      toast('Too slow — Rosa gives you another shot', '#e74c3c');
+      beginMission(game.missionIndex);
+      return;
+    }
+    if (done) {
+      const reward = MONEY.missionReward[game.missionIndex] || 500;
+      world.player.cash += reward;
+      toast('Mission complete — +$' + reward, '#2ecc71');
+      audio.jingle();
+      saveGame();
+      game.best = Math.max(game.best, game.missionIndex + 1);
+      try { localStorage.setItem(BEST_KEY, String(game.best)); } catch (e) { /* private mode */ }
+      if (game.missionIndex + 1 >= MISSIONS.length) {
+        game.screen = SCREEN_WIN;
+        setStatus('Story complete');
+      } else {
+        beginMission(game.missionIndex + 1);
+      }
+      return;
+    }
   }
 
-  updateMenus();
-  render.draw(G);
-  if (statusEl) {
-    const m = missions.current();
-    statusEl.textContent = G.state === 'play'
-      ? `Solport — ${m ? m.title : 'Free roam'} — cash $${G.cash}, wanted ${G.wanted} star${G.wanted === 1 ? '' : 's'}`
-      : 'Solport — a sun-soaked open-world crime story';
+  if (world.player.busted) {
+    const p = world.player;
+    const lost = Math.min(p.cash, 200);
+    p.cash -= lost;
+    p.health = 100;
+    p.busted = false;
+    p.inCar = null;
+    p.x = world.places.safehouse.x;
+    p.y = world.places.safehouse.y;
+    world.wanted = 0;
+    world.cops = [];
+    world.heat = 0;
+    game.screen = SCREEN_BUSTED;
+    setStatus('Busted — the cops took $' + lost);
+    return;
   }
+  if (world.player.dead) {
+    game.screen = SCREEN_OVER;
+    setStatus('Wasted');
+    return;
+  }
+
+  // Camera follows the player, centred after the step.
+  game.cam.x = Math.max(VIEW.width / 2, Math.min(WORLD.width - VIEW.width / 2, world.player.x));
+  game.cam.y = Math.max(VIEW.height / 2, Math.min(WORLD.height - VIEW.height / 2, world.player.y));
+
+  // Audio follows the game.
+  audio.ensure();
+  audio.setEngine(world.player.inCar ? Math.abs(world.player.inCar.speed) / 560 : 0);
+  audio.setSiren(world.wanted > 0, dt);
+
+  for (const t of game.toasts) t.t -= dt;
+  game.toasts = game.toasts.filter((t) => t.t > 0);
   } finally {
-    // Always clear per-frame input, even if an update throws, so one bad
-    // frame can't stick a key or a click down forever.
     input.endFrame();
   }
 }
 
-// Screenshot staging (?shot=start|play|foot|mission) for the maker's shots.
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-if (shot) {
-  stageShot(G, shot);
-  if (shot !== 'start') {
-    G.state = 'play';
-    audio.ensure();
+function render() {
+  ctx.clearRect(0, 0, VIEW.width, VIEW.height);
+  if (game.screen === SCREEN_TITLE) {
+    renderWorld(ctx, world, game.cam);
+    renderTitle(ctx, game);
+    return;
   }
-  render.draw(G);
-} else {
-  requestAnimationFrame(frame);
+  renderWorld(ctx, world, game.cam);
+  if (game.screen === SCREEN_PLAY || game.screen === 'dialogue' || game.screen === 'shop' || game.paused) {
+    renderHud(ctx, world, game);
+    if (game.screen === 'dialogue') renderDialogue(ctx, world);
+    if (game.screen === 'shop') renderShop(ctx, game);
+    if (game.paused) renderCenter(ctx, 'PAUSED', 'Esc to resume', '#fff');
+    return;
+  }
+  if (game.screen === SCREEN_BUSTED) {
+    renderHud(ctx, world, game);
+    renderCenter(ctx, 'BUSTED', 'The cops took $200. Rosa is not impressed.', '#ffd94d');
+    return;
+  }
+  if (game.screen === SCREEN_OVER) {
+    renderCenter(ctx, 'WASTED', 'Rico is down. The city keeps moving without you.', '#e74c3c');
+    return;
+  }
+  if (game.screen === SCREEN_WIN) {
+    renderHud(ctx, world, game);
+    renderCenter(ctx, 'SOLPORT IS YOURS', 'All five of Rosa\u2019s jobs done. The vault money is safe.', '#2ecc71');
+  }
 }
 
-// A small handle for automated checks: state, cash, wanted, player, missions.
-window.__solport = G;
+function titleClick() {
+  const rect = canvas.getBoundingClientRect();
+  const mx = input.mouse.x * (VIEW.width / rect.width);
+  const my = input.mouse.y * (VIEW.height / rect.height);
+  for (const b of game.titleButtons) {
+    b.hover = mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h;
+  }
+  if (!input.mouse.clicked) return;
+  for (const b of game.titleButtons) {
+    if (!b.hover) continue;
+    audio.ensure();
+    if (b.label === 'NEW GAME') {
+      game.missionIndex = 0;
+      beginMission(0);
+      setStatus('Mission 1: Wheels');
+    } else if (b.label === 'CONTINUE' && game.saveData) {
+      loadSave(game.saveData);
+      game.screen = SCREEN_PLAY;
+      setStatus('Back on the streets');
+    } else if (b.label === 'HOW TO PLAY') {
+      toast('WASD move/drive · E interact · F car · Click shoot · M mute');
+    }
+    return;
+  }
+}
+
+// Staged screenshot mode: play the scene forward, render one frame, stop.
+if (shotName) {
+  const staged = stageShot(shotName, world, (w, inp, dt) => stepWorld(w, inp, dt, fireBullet));
+  game.screen = staged.screen;
+  game.cam.x = Math.max(VIEW.width / 2, Math.min(WORLD.width - VIEW.width / 2, world.player.x));
+  game.cam.y = Math.max(VIEW.height / 2, Math.min(WORLD.height - VIEW.height / 2, world.player.y));
+  render();
+  document.title = 'Solport — shot ' + shotName;
+} else {
+  let last = performance.now();
+  let acc = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    if (game.screen === SCREEN_TITLE) {
+      titleClick();
+      // Keep the city alive behind the title.
+      stepWorld(world, { held: {}, pressed: {}, mouse: input.mouse }, dt, () => {});
+      world.events.length = 0;
+      game.cam.x = Math.max(VIEW.width / 2, Math.min(WORLD.width - VIEW.width / 2, world.player.x));
+      game.cam.y = Math.max(VIEW.height / 2, Math.min(WORLD.height - VIEW.height / 2, world.player.y));
+      input.endFrame();
+    } else if (game.screen === SCREEN_BUSTED || game.screen === SCREEN_OVER || game.screen === SCREEN_WIN) {
+      if (input.pressed.confirm || input.pressed.interact) {
+        if (game.screen === SCREEN_WIN) { game.screen = SCREEN_TITLE; layoutTitleButtons(); }
+        else { world.player.dead = false; world.player.health = 100; game.screen = SCREEN_PLAY; }
+      }
+      input.endFrame();
+    } else {
+      acc += dt;
+      let n = 0;
+      while (acc >= STEP && n < 5) {
+        step(STEP);
+        acc -= STEP;
+        n += 1;
+      }
+      if (n === 5) acc = 0;
+    }
+    render();
+  }
+  requestAnimationFrame(frame);
+}
